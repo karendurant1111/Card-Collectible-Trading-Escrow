@@ -7,14 +7,20 @@
 (define-constant ERR-NOT-EXPIRED (err u1007))
 (define-constant ERR-INVALID-AMOUNT (err u1008))
 (define-constant ERR-SAME-TRADER (err u1009))
+(define-constant ERR-AUCTION-ENDED (err u1010))
+(define-constant ERR-BID-TOO-LOW (err u1011))
+(define-constant ERR-AUCTION-ACTIVE (err u1012))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant TRADE-TIMEOUT u144)
 (define-constant MIN-ESCROW-FEE u1000)
+(define-constant AUCTION-DURATION u288)
+(define-constant MIN-BID-INCREMENT u100)
 
 (define-data-var next-trade-id uint u1)
 (define-data-var contract-fee-rate uint u100)
 (define-data-var collected-fees uint u0)
+(define-data-var next-auction-id uint u1)
 
 (define-map trades 
   { trade-id: uint }
@@ -63,6 +69,25 @@
     created-at: uint,
     resolved: bool
   }
+)
+
+(define-map auctions
+  { auction-id: uint }
+  {
+    seller: principal,
+    card-id: uint,
+    starting-price: uint,
+    current-bid: uint,
+    highest-bidder: (optional principal),
+    end-block: uint,
+    status: (string-ascii 20),
+    created-at: uint
+  }
+)
+
+(define-map auction-bids
+  { auction-id: uint, bidder: principal }
+  { bid-amount: uint, bid-time: uint }
 )
 
 (define-private (get-trade-fee (amount uint))
@@ -331,6 +356,102 @@
   )
 )
 
+(define-public (create-auction (card-id uint) (starting-price uint))
+  (let ((auction-id (var-get next-auction-id)))
+    (asserts! (is-valid-card-owner tx-sender card-id) ERR-NOT-AUTHORIZED)
+    (asserts! (> starting-price u0) ERR-INVALID-AMOUNT)
+    (let ((card-info (unwrap! (map-get? user-cards { owner: tx-sender, card-id: card-id }) ERR-NOT-FOUND)))
+      (asserts! (get is-tradeable card-info) ERR-INVALID-STATE)
+      (map-set auctions
+        { auction-id: auction-id }
+        {
+          seller: tx-sender,
+          card-id: card-id,
+          starting-price: starting-price,
+          current-bid: starting-price,
+          highest-bidder: none,
+          end-block: (+ stacks-block-height AUCTION-DURATION),
+          status: "active",
+          created-at: stacks-block-height
+        }
+      )
+      (var-set next-auction-id (+ auction-id u1))
+      (ok auction-id)
+    )
+  )
+)
+
+(define-public (place-bid (auction-id uint) (bid-amount uint))
+  (let ((auction (unwrap! (map-get? auctions { auction-id: auction-id }) ERR-NOT-FOUND))
+        (user-balance (default-to u0 (get balance (map-get? user-balances { user: tx-sender })))))
+    (asserts! (not (is-eq tx-sender (get seller auction))) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status auction) "active") ERR-INVALID-STATE)
+    (asserts! (<= stacks-block-height (get end-block auction)) ERR-AUCTION-ENDED)
+    (asserts! (>= bid-amount (+ (get current-bid auction) MIN-BID-INCREMENT)) ERR-BID-TOO-LOW)
+    (asserts! (>= user-balance bid-amount) ERR-INSUFFICIENT-FUNDS)
+    (let ((previous-highest-bidder (get highest-bidder auction))
+          (previous-bid (get current-bid auction)))
+      (match previous-highest-bidder
+        prev-bidder
+        (let ((prev-balance (default-to u0 (get balance (map-get? user-balances { user: prev-bidder })))))
+          (map-set user-balances { user: prev-bidder } { balance: (+ prev-balance previous-bid) }))
+        true
+      )
+      (map-set user-balances { user: tx-sender } { balance: (- user-balance bid-amount) })
+      (map-set auctions
+        { auction-id: auction-id }
+        (merge auction {
+          current-bid: bid-amount,
+          highest-bidder: (some tx-sender)
+        })
+      )
+      (map-set auction-bids
+        { auction-id: auction-id, bidder: tx-sender }
+        { bid-amount: bid-amount, bid-time: stacks-block-height }
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (end-auction (auction-id uint))
+  (let ((auction (unwrap! (map-get? auctions { auction-id: auction-id }) ERR-NOT-FOUND)))
+    (asserts! (is-eq (get status auction) "active") ERR-INVALID-STATE)
+    (asserts! (> stacks-block-height (get end-block auction)) ERR-AUCTION-ACTIVE)
+    (match (get highest-bidder auction)
+      winner
+      (begin
+        (try! (transfer-card (get seller auction) winner (get card-id auction)))
+        (let ((seller-balance (default-to u0 (get balance (map-get? user-balances { user: (get seller auction) }))))
+              (auction-fee (get-trade-fee (get current-bid auction)))
+              (seller-proceeds (- (get current-bid auction) auction-fee)))
+          (map-set user-balances
+            { user: (get seller auction) }
+            { balance: (+ seller-balance seller-proceeds) }
+          )
+          (var-set collected-fees (+ (var-get collected-fees) auction-fee))
+          (map-set auctions { auction-id: auction-id } (merge auction { status: "completed" }))
+          (ok true)
+        )
+      )
+      (begin
+        (map-set auctions { auction-id: auction-id } (merge auction { status: "no-bids" }))
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-public (cancel-auction (auction-id uint))
+  (let ((auction (unwrap! (map-get? auctions { auction-id: auction-id }) ERR-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get seller auction)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status auction) "active") ERR-INVALID-STATE)
+    (asserts! (is-none (get highest-bidder auction)) ERR-INVALID-STATE)
+    (map-set auctions { auction-id: auction-id } (merge auction { status: "cancelled" }))
+    (ok true)
+  )
+)
+
 (define-read-only (get-trade (trade-id uint))
   (map-get? trades { trade-id: trade-id })
 )
@@ -351,41 +472,21 @@
   (map-get? trade-disputes { trade-id: trade-id })
 )
 
+(define-read-only (get-auction (auction-id uint))
+  (map-get? auctions { auction-id: auction-id })
+)
+
+(define-read-only (get-bid (auction-id uint) (bidder principal))
+  (map-get? auction-bids { auction-id: auction-id, bidder: bidder })
+)
+
 (define-read-only (get-contract-stats)
   {
     next-trade-id: (var-get next-trade-id),
+    next-auction-id: (var-get next-auction-id),
     fee-rate: (var-get contract-fee-rate),
     collected-fees: (var-get collected-fees),
     current-block: stacks-block-height
   }
 )
-
-;; title: Card-Collectible-Trading-Escrow
-;; version:
-;; summary:
-;; description:
-
-;; traits
-;;
-
-;; token definitions
-;;
-
-;; constants
-;;
-
-;; data vars
-;;
-
-;; data maps
-;;
-
-;; public functions
-;;
-
-;; read only functions
-;;
-
-;; private functions
-;;
 
