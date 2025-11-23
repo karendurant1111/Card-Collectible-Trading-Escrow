@@ -21,6 +21,7 @@
 (define-data-var contract-fee-rate uint u100)
 (define-data-var collected-fees uint u0)
 (define-data-var next-auction-id uint u1)
+(define-data-var next-listing-id uint u1)
 
 (define-map trades 
   { trade-id: uint }
@@ -80,6 +81,17 @@
     current-bid: uint,
     highest-bidder: (optional principal),
     end-block: uint,
+    status: (string-ascii 20),
+    created-at: uint
+  }
+)
+
+(define-map listings
+  { listing-id: uint }
+  {
+    seller: principal,
+    card-id: uint,
+    price: uint,
     status: (string-ascii 20),
     created-at: uint
   }
@@ -452,6 +464,71 @@
   )
 )
 
+(define-public (create-listing (card-id uint) (price uint))
+  (let ((listing-id (var-get next-listing-id)))
+    (asserts! (is-valid-card-owner tx-sender card-id) ERR-NOT-AUTHORIZED)
+    (asserts! (> price u0) ERR-INVALID-AMOUNT)
+    (let ((card-info (unwrap! (map-get? user-cards { owner: tx-sender, card-id: card-id }) ERR-NOT-FOUND)))
+      (asserts! (get is-tradeable card-info) ERR-INVALID-STATE)
+      (map-set listings
+        { listing-id: listing-id }
+        {
+          seller: tx-sender,
+          card-id: card-id,
+          price: price,
+          status: "active",
+          created-at: stacks-block-height
+        }
+      )
+      (var-set next-listing-id (+ listing-id u1))
+      (ok listing-id)
+    )
+  )
+)
+
+(define-public (purchase-listing (listing-id uint))
+  (let ((listing (unwrap! (map-get? listings { listing-id: listing-id }) ERR-NOT-FOUND))
+        (buyer-balance (default-to u0 (get balance (map-get? user-balances { user: tx-sender }))))
+        (platform-fee (get-trade-fee (get price listing)))
+        (total-cost (get price listing))
+        (seller (get seller listing)))
+    (asserts! (is-eq (get status listing) "active") ERR-INVALID-STATE)
+    (asserts! (not (is-eq tx-sender seller)) ERR-SAME-TRADER)
+    (asserts! (>= buyer-balance total-cost) ERR-INSUFFICIENT-FUNDS)
+    (asserts! (is-valid-card-owner seller (get card-id listing)) ERR-NOT-AUTHORIZED)
+    (map-set user-balances
+      { user: tx-sender }
+      { balance: (- buyer-balance total-cost) }
+    )
+    (let ((seller-balance (default-to u0 (get balance (map-get? user-balances { user: seller }))))
+          (seller-proceeds (- total-cost platform-fee)))
+      (map-set user-balances
+        { user: seller }
+        { balance: (+ seller-balance seller-proceeds) }
+      )
+      (var-set collected-fees (+ (var-get collected-fees) platform-fee))
+    )
+    (try! (transfer-card seller tx-sender (get card-id listing)))
+    (map-set listings
+      { listing-id: listing-id }
+      (merge listing { status: "completed" })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-listing (listing-id uint))
+  (let ((listing (unwrap! (map-get? listings { listing-id: listing-id }) ERR-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get seller listing)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status listing) "active") ERR-INVALID-STATE)
+    (map-set listings
+      { listing-id: listing-id }
+      (merge listing { status: "cancelled" })
+    )
+    (ok true)
+  )
+)
+
 (define-read-only (get-trade (trade-id uint))
   (map-get? trades { trade-id: trade-id })
 )
@@ -474,6 +551,10 @@
 
 (define-read-only (get-auction (auction-id uint))
   (map-get? auctions { auction-id: auction-id })
+)
+
+(define-read-only (get-listing (listing-id uint))
+  (map-get? listings { listing-id: listing-id })
 )
 
 (define-read-only (get-bid (auction-id uint) (bidder principal))
